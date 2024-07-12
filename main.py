@@ -2,30 +2,45 @@ import os
 import random
 import cv2
 import numpy as np
-import pandas as pd
 import tensorflow as tf
-from tensorflow.keras import layers, models
+import keras
+from keras import layers, Model
 from sklearn.preprocessing import StandardScaler
 from joblib import dump, load
 import multiprocessing
+from tqdm import tqdm
+import asyncio
+import loader_videos_YT
+from edsr import make_model
 
 def extract_frames_from_video(video_path, frame_dir):
-    video_name = os.path.basename(video_path)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
     
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_path = os.path.join(frame_dir, f"{video_name}_{frame_count:06d}.png")
-        cv2.imwrite(frame_path, frame)
-        frame_count += 1
+    if not cap.isOpened():
+        print(f"Ошибка: Невозможно открыть видеофайл {video_path}")
+        return
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    with tqdm(total=total_frames, desc=f"Обработка {video_name}") as pbar:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_path = os.path.join(frame_dir, f"{video_name}_{frame_count:06d}.png")
+            cv2.imwrite(frame_path, frame)
+            frame_count += 1
+            pbar.update(1)
     
     cap.release()
     cv2.destroyAllWindows()
     
-    os.remove(video_path)
+    if frame_count > 0:
+        os.remove(video_path)
+    else:
+        print(f"Ошибка: Не удалось извлечь кадры из {video_path}")
 
 def extract_frames(video_dir="data/videos", frame_dir="data/frames"):
     if not os.path.exists(frame_dir):
@@ -65,13 +80,18 @@ def data_augmentation():
         tf.keras.layers.RandomZoom(0.2),
     ])
 
-def standardize_frames(frames):
-    scaler = StandardScaler()
-    standardized_data = scaler.fit_transform(frames.reshape(-1, frames.shape[-1]))
-    dump(scaler, "scaler_model.joblib")
+def standardize_frames(frames, is_val=False, y_or_x=None):
+    frames = frames.astype(np.float32) / 255.0 
+    if not is_val:
+        scaler = StandardScaler()
+        standardized_data = scaler.fit_transform(frames.reshape(-1, frames.shape[-1]))
+        dump(scaler, f"scaler_model{y_or_x}.joblib")
+    else:
+        scaler = load(f"scaler_model{y_or_x}.joblib")
+        standardized_data = scaler.transform(frames.reshape(-1, frames.shape[-1]))
     return standardized_data.reshape(frames.shape)
 
-def create_dataset(image_dir="data/images"):
+def create_dataset(image_dir="data/frames"):
     x_data = []
     y_data = []
     
@@ -83,21 +103,19 @@ def create_dataset(image_dir="data/images"):
         if image is None:
             continue
         
-        y_image = cv2.resize(image, (720, 720)) 
+        y_image = cv2.resize(image, (144, 144)) 
         x_image = downscale_and_add_noise(y_image)  
-        x_image = cv2.resize(x_image, (360, 360))  
+        x_image = cv2.resize(x_image, (36, 36))  
         
         x_data.append(x_image)
         y_data.append(y_image)
     
     x_data = np.array(x_data)
     y_data = np.array(y_data)
-    
-    x_data_standardized = standardize_frames(x_data)
-    
+        
     augmentation = data_augmentation()
     
-    x_data_aug = augmentation(x_data_standardized)
+    x_data_aug = augmentation(x_data)
     y_data_aug = augmentation(y_data)
     return x_data_aug, y_data_aug
 
@@ -113,69 +131,31 @@ def psnr_metric(y_true, y_pred):
 def ssim_metric(y_true, y_pred):
     return tf.image.ssim(y_true, y_pred, max_val=1.0)
 
-def unet_model(input_shape):
-    inputs = tf.keras.Input(shape=input_shape)
-    
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
-    c1 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(c1)
-    p1 = layers.MaxPooling2D((2, 2))(c1)
 
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(p1)
-    c2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(c2)
-    p2 = layers.MaxPooling2D((2, 2))(c2)
-
-    c3 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(p2)
-    c3 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(c3)
-    p3 = layers.MaxPooling2D((2, 2))(c3)
-
-    c4 = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(p3)
-    c4 = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(c4)
-    p4 = layers.MaxPooling2D((2, 2))(c4)
-
-    c5 = layers.Conv2D(1024, (3, 3), activation='relu', padding='same')(p4)
-    c5 = layers.Conv2D(1024, (3, 3), activation='relu', padding='same')(c5)
-
-    u6 = layers.UpSampling2D((2, 2))(c5)
-    u6 = layers.concatenate([u6, c4])
-    c6 = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(u6)
-    c6 = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(c6)
-
-    u7 = layers.UpSampling2D((2, 2))(c6)
-    u7 = layers.concatenate([u7, c3])
-    c7 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(u7)
-    c7 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(c7)
-
-    u8 = layers.UpSampling2D((2, 2))(c7)
-    u8 = layers.concatenate([u8, c2])
-    c8 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(u8)
-    c8 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(c8)
-
-    u9 = layers.UpSampling2D((2, 2))(c8)
-    u9 = layers.concatenate([u9, c1])
-    c9 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(u9)
-    c9 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(c9)
-
-    outputs = layers.Conv2D(3, (1, 1), activation='sigmoid', padding='same')(c9)
-    
-    model = models.Model(inputs, outputs)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
-    loss_fn = tf.keras.losses.MeanSquaredError()
-    model.compile(optimizer=optimizer, loss=loss_fn, metrics=["accuracy", psnr_metric, ssim_metric])
-    return model
 
 if __name__ == "__main__":
+    asyncio.run(loader_videos_YT.download())
     extract_frames()
+    
     x_data, y_data = create_dataset()
     x_train, x_val, y_train, y_val = split_dataset(x_data, y_data)
     
-    unet = unet_model((360, 360, 3))
-    unet.summary()
+    x_train = standardize_frames(x_train, is_val=False, y_or_x="x")
+    x_val = standardize_frames(x_val, is_val=True, y_or_x="x")
+    y_train = standardize_frames(y_train, is_val=False, y_or_x="y")
+    y_val = standardize_frames(y_val, is_val=True, y_or_x="y")
     
-    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint("unet_model_best.h5", save_best_only=True)
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint("edsr_model_best.h5", save_best_only=True)
     early_stopping_cb = tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
     reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=5, min_lr=0.00001)
     tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir="./logs")
     callbacks = [checkpoint_cb, early_stopping_cb, reduce_lr_cb, tensorboard_cb]
     
-    unet.fit(x_train, y_train, epochs=50, batch_size=16, validation_data=(x_val, y_val), callbacks=callbacks)
-    
+    edsr_model = make_model(num_filters=64, num_of_residual_blocks=16)
+    optim_edsr = keras.optimizers.Adam(
+    learning_rate=keras.optimizers.schedules.PiecewiseConstantDecay(
+        boundaries=[5000], values=[1e-4, 5e-5]
+    )
+)
+    edsr_model.compile(optimizer=optim_edsr, loss="mae", metrics=[psnr_metric, ssim_metric, "accuracy", "mse"])
+    edsr_model.fit(x_train, y_train, validation_data = [x_val, y_val], batch_size=2, epochs=100, steps_per_epoch=200, callbacks=callbacks)
