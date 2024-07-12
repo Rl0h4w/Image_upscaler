@@ -21,8 +21,8 @@ To set up the project, follow these steps:
 1. **Clone the repository:**
 
     ```sh
-    git clone <repository_url>
-    cd <repository_directory>
+    git clone <https://github.com/Rl0h4w/Image_upscaler>
+    cd <https://github.com/Rl0h4w/Image_upscaler>
     ```
 
 2. **Install the required dependencies:**
