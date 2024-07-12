@@ -1,0 +1,10 @@
+tensorflow
+opencv-python
+numpy
+scikit-learn
+joblib
+tqdm
+pytube
+bs4
+selenium
+webdriver-manager
